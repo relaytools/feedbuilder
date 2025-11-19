@@ -17,8 +17,11 @@ Data directory (defaults to `relay_data/` next to where you run the command):
 - `outbox_exclude.txt` — Optional input list of relays you do NOT want to publish to (one URL per line).
 - `pubkey_relays_map_read.txt` — Output; pubkey→relay mapping for read/REQ coverage.
 - `pubkey_relays_map_write.txt` — Output; pubkey→relay mapping for outbox/write.
+- `pubkey_relays_map.txt` — Output; canonical map used by gen-router (points to WRITE pairs).
+- `pubkey_relays_map_online.txt` — Optional output; filtered map with only online relays (if `--check-monitors` used).
 - `optimal_relay_set.txt` — Output; relays chosen by greedy set cover (from READ map, excludes honored).
 - `outbox_relays.txt` — Output; relays for uploads derived from WRITE map, excludes honored.
+- `relay_monitor_report.txt` — Optional output; NIP-66 relay liveness report (if `--check-monitors` used).
 
 ## Install & Run
 
@@ -57,7 +60,26 @@ Analyze (reads `relay_data/all_relay_lists.jsonl` and `relay_data/follows_list.t
   --data-dir ./relay_data
 ```
 
-Generate router config:
+Optionally check relay liveness using NIP-66 monitors:
+```
+./nostr-go-router analyze \
+  --data-dir ./relay_data \
+  --check-monitors \
+  --monitor-relays "wss://relay.nostr.band,wss://history.nostr.watch" \
+  --monitor-timeout 10
+```
+
+This queries NIP-66 relay monitors for kind 30166 events and generates a report showing:
+- **Online/Offline status** for each relay
+- **RTT (Round Trip Time)** metrics (open, read, write)
+- **Monitor count** - how many monitors reported data
+- **Last checked** timestamp
+
+Output files:
+- `relay_monitor_report.txt` - Full monitoring report
+- `pubkey_relays_map_online.txt` - Filtered map with only online relays
+
+Generate router config (optionally using only online relays):
 ```
 ./nostr-go-router gen-router \
   --data-dir ./relay_data \
@@ -65,6 +87,16 @@ Generate router config:
   --authors-per-stream 300 \
   --stream-prefix follows \
   --include-unassigned \
+  --replicas 1
+```
+
+To use only online relays (requires running analyze with `--check-monitors` first):
+```
+./nostr-go-router gen-router \
+  --data-dir ./relay_data \
+  --output ./strfry-router.config \
+  --online-only \
+  --authors-per-stream 300 \
   --replicas 1
 ```
 
@@ -90,4 +122,6 @@ Note: You must run `collect` with `--pubkey` first to populate these files.
 - **Intelligent relay selection**: Uses greedy set cover algorithm to minimize relay connections while maximizing author coverage
 - **Progress tracking**: Real-time progress output during collection with event counts and batch completion
 - **Notification streams**: Add inbox/outbox streams to router config for syncing your personal posts and mentions
+- **NIP-66 relay monitoring**: Check relay liveness and performance using community monitors
 - **Flexible configuration**: Control batch sizes, parallelism, timeouts, and replica counts
+- **URL validation**: Automatically filters out invalid relay URLs (with query parameters, etc.)

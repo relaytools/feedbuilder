@@ -120,6 +120,7 @@ func genRouterCmd(args []string) {
 	includeUnassigned := fs.Bool("include-unassigned", false, "add one stream querying all selected relays for any unassigned authors (rare)")
 	replicas := fs.Int("replicas", 1, "number of distinct relays to assign each author to (>=1)")
 	kindsJSON := fs.String("kinds-json", "", "JSON array for down streams kinds filter (e.g. [0,1,3])")
+	onlineOnly := fs.Bool("online-only", false, "use only online relays from NIP-66 monitoring (requires analyze --check-monitors)")
 
 	// Notification sync options
 	includeNotifs := fs.Bool("include-notifs", false, "add streams for user notifications (your posts and mentions)")
@@ -132,6 +133,10 @@ func genRouterCmd(args []string) {
 	dd := *dataDir
 	// Inputs
 	mapFile := filepath.Join(dd, "pubkey_relays_map.txt")
+	if *onlineOnly {
+		mapFile = filepath.Join(dd, "pubkey_relays_map_online.txt")
+		fmt.Println("Using online-only relay map from NIP-66 monitoring")
+	}
 	followsFile := filepath.Join(dd, "follows_list.txt")
 	userRelayListFile := filepath.Join(dd, "user_relay_list.txt")
 	userPubkeyFile := filepath.Join(dd, "user_pubkey.txt")
