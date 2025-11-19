@@ -1,4 +1,4 @@
-# nostr-go-router
+# feedbuilder 
 
 Go-based tools to analyze kind-10002 relay lists and generate a `strfry router` config.
 
@@ -7,6 +7,12 @@ Subcommands:
 - `collect` — Fetch follows (kind 3) and relay lists (kind 10002) into data directory.
 - `analyze` — Parse JSONL `10002` events, build READ/WRITE pubkey→relay maps, apply exclude hosts, compute optimal relay set (greedy), and derive outbox relays.
 - `gen-router` — Generate a `strfry router` taocpp::config file using per-relay authors and the computed sets. Optionally generate notification sync commands.
+
+## Cool stuff
+
+So for now, we have all these .txt files, and 3 separate phases of running our generator.  That means, you can make edits to these files, to test different things (like adding a relay to your notifications stream, WITHOUT having to publish a whole new 10002 relay list simply by editing "relay_data/user_relay_list.txt")
+
+This will evolve until we have the ultimate outbox routing and user configurations mapped out.
 
 Data directory (defaults to `relay_data/` next to where you run the command):
 
@@ -28,13 +34,14 @@ Data directory (defaults to `relay_data/` next to where you run the command):
 - Requires Go 1.22+
 
 ```
-cd go-router
-go build -o nostr-go-router ./...
+git clone https://github.com/relaytools/feedbuilder
+cd feedbuilder
+go build
 ```
 
 Collect your relay list, follows, and their relay lists:
 ```
-./nostr-go-router collect \
+./feedbuilder collect \
   --pubkey <your-64-hex-pubkey> \
   --data-dir ./relay_data \
   --relays "wss://relay.damus.io,wss://nos.lol,wss://nostr.wine" \
@@ -47,25 +54,18 @@ This will:
 2. Fetch your follow list (kind 3) and save to `follows_list.txt`
 3. Fetch relay lists (kind 10002) for all your follows and save to `all_relay_lists.jsonl`
 
-**Performance notes:**
-- Opens **one connection per relay** and reuses it for all batches (efficient!)
-- Uses EOSE (End Of Stored Events) detection to exit as soon as relays finish sending data
-- Default: 4 parallel relays, 50 authors per batch, 12 second timeout per batch
-- Increase `--parallel` to query more relays simultaneously (e.g., `--parallel 6` for all default relays)
-- Each batch typically completes in 1-3 seconds via EOSE; timeout is a safety fallback
-
 Analyze (reads `relay_data/all_relay_lists.jsonl` and `relay_data/follows_list.txt`):
 ```
-./nostr-go-router analyze \
+./feedbuilder analyze \
   --data-dir ./relay_data
 ```
 
 Optionally check relay liveness using NIP-66 monitors:
 ```
-./nostr-go-router analyze \
+./feedbuilder analyze \
   --data-dir ./relay_data \
   --check-monitors \
-  --monitor-relays "wss://relay.nostr.band,wss://history.nostr.watch" \
+  --monitor-relays "wss://relaypag.es,wss://monitorlizard.nostr1.com" \
   --monitor-timeout 10
 ```
 
@@ -81,7 +81,7 @@ Output files:
 
 Generate router config (optionally using only online relays):
 ```
-./nostr-go-router gen-router \
+./feedbuilder gen-router \
   --data-dir ./relay_data \
   --output ./strfry-router.config \
   --authors-per-stream 300 \
@@ -92,7 +92,7 @@ Generate router config (optionally using only online relays):
 
 To use only online relays (requires running analyze with `--check-monitors` first):
 ```
-./nostr-go-router gen-router \
+./feedbuilder gen-router \
   --data-dir ./relay_data \
   --output ./strfry-router.config \
   --online-only \
@@ -123,5 +123,3 @@ Note: You must run `collect` with `--pubkey` first to populate these files.
 - **Progress tracking**: Real-time progress output during collection with event counts and batch completion
 - **Notification streams**: Add inbox/outbox streams to router config for syncing your personal posts and mentions
 - **NIP-66 relay monitoring**: Check relay liveness and performance using community monitors
-- **Flexible configuration**: Control batch sizes, parallelism, timeouts, and replica counts
-- **URL validation**: Automatically filters out invalid relay URLs (with query parameters, etc.)
