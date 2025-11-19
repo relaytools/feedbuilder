@@ -26,12 +26,6 @@ type set map[string]struct{}
 func (s set) add(v string)      { s[v] = struct{}{} }
 func (s set) has(v string) bool { _, ok := s[v]; return ok }
 
-func normalizeURL(u string) string {
-	u = strings.ToLower(strings.TrimSpace(u))
-	u = strings.TrimSuffix(u, "/")
-	return u
-}
-
 func urlToHost(u string) string {
 	u = strings.ToLower(strings.TrimSpace(u))
 	u = strings.TrimPrefix(u, "wss://")

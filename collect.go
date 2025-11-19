@@ -10,13 +10,26 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nostr "github.com/nbd-wtf/go-nostr"
 )
 
-// evLine is used to serialize JSONL writes from concurrent subscriptions
-type evLine struct{ id, line string }
+// eventLine represents a relay list event for serialized JSONL writes
+type eventLine struct {
+	id   string
+	line string
+}
+
+// progressTracker tracks collection progress across goroutines
+type progressTracker struct {
+	eventsReceived atomic.Int64
+	eventsWritten  atomic.Int64
+	batchesTotal   int
+	batchesDone    atomic.Int64
+	relaysTotal    int
+}
 
 func collectCmd(args []string) {
 	fs := flag.NewFlagSet("collect", flag.ExitOnError)
@@ -27,92 +40,187 @@ func collectCmd(args []string) {
 	batchSize := fs.Int("batch-size", 50, "number of authors per 10002 REQ batch")
 	timeoutSec := fs.Int("timeout", 12, "seconds to wait for REQ per relay/batch")
 	parallel := fs.Int("parallel", 4, "number of relays to query in parallel for 10002")
-	if err := fs.Parse(args); err != nil { panic(err) }
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to parse flags: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *pubkey == "" || !isHex64(strings.ToLower(*pubkey)) {
 		fmt.Fprintln(os.Stderr, "--pubkey (64-hex) is required and must be valid hex")
 		os.Exit(1)
 	}
 
-	dd := *dataDir
-	if err := os.MkdirAll(dd, 0o755); err != nil { panic(err) }
-	jsonlPath := filepath.Join(dd, "all_relay_lists.jsonl")
-	followsPath := filepath.Join(dd, "follows_list.txt")
+	dataDirectory := *dataDir
+	if err := os.MkdirAll(dataDirectory, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create data directory: %v\n", err)
+		os.Exit(1)
+	}
+	jsonlPath := filepath.Join(dataDirectory, "all_relay_lists.jsonl")
+	followsPath := filepath.Join(dataDirectory, "follows_list.txt")
+	userRelayListPath := filepath.Join(dataDirectory, "user_relay_list.txt")
+	userPubkeyPath := filepath.Join(dataDirectory, "user_pubkey.txt")
 
 	relays := splitCSV(*relaysCSV)
 	if len(relays) == 0 {
 		fmt.Fprintln(os.Stderr, "no relays provided")
 		os.Exit(1)
 	}
-	fr := *followRelay
-	if fr == "" { fr = relays[0] }
+	followRelayURL := *followRelay
+	if followRelayURL == "" {
+		followRelayURL = relays[0]
+	}
 
-	// 1) Fetch follows (kind 3)
-	fmt.Println("Step 1: Fetching your follow list (kind 3)...")
-	follows, err := fetchFollows(fr, *pubkey, time.Duration(*timeoutSec)*time.Second)
+	ctx := context.Background()
+	timeout := time.Duration(*timeoutSec) * time.Second
+	
+	// Step 1: Fetch user's own relay list (kind 10002)
+	fmt.Println("\n==> Step 1: Fetching your relay list (kind 10002)")
+	fmt.Printf("    Connecting to %s...\n", followRelayURL)
+	
+	userRelays, err := fetchUserRelayList(ctx, followRelayURL, *pubkey, timeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get follows from %s: %v\n", fr, err)
+		fmt.Fprintf(os.Stderr, "warning: failed to get your relay list from %s: %v\n", followRelayURL, err)
+		// Continue anyway - not critical
+	} else if len(userRelays) > 0 {
+		if err := writeLines(userRelayListPath, userRelays); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to write user relay list: %v\n", err)
+		} else {
+			fmt.Printf("    ✓ Found %d relays in your relay list\n", len(userRelays))
+		}
+	} else {
+		fmt.Println("    ⚠ No relay list found for your pubkey")
+	}
+	
+	// Step 2: Fetch follows (kind 3)
+	fmt.Println("\n==> Step 2: Fetching your follow list (kind 3)")
+	fmt.Printf("    Connecting to %s...\n", followRelayURL)
+	
+	follows, err := fetchFollows(ctx, followRelayURL, *pubkey, timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get follows from %s: %v\n", followRelayURL, err)
 		os.Exit(1)
 	}
+	
 	if len(follows) == 0 {
-		fmt.Println("No follows found; nothing to do")
-		_ = writeLines(followsPath, nil)
+		fmt.Println("    No follows found; nothing to do")
+		if err := writeLines(followsPath, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write follows file: %v\n", err)
+		}
 		os.Exit(0)
 	}
-	_ = writeLines(followsPath, follows)
-	fmt.Printf("Found %d follows.\n", len(follows))
+	
+	if err := writeLines(followsPath, follows); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write follows file: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("    ✓ Found %d follows\n", len(follows))
+	
+	// Save user pubkey for later use
+	if err := writeLines(userPubkeyPath, []string{strings.ToLower(*pubkey)}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to write user pubkey file: %v\n", err)
+	}
 
-	// 2) Fetch kind 10002 relay-list events for follows in batches across relays
-	fmt.Println("Step 2: Fetching kind 10002 relay lists for follows across relays...")
-	ctx := context.Background()
-
+	// Step 3: Fetch kind 10002 relay-list events for follows in batches across relays
+	fmt.Println("\n==> Step 3: Fetching kind 10002 relay lists for follows")
+	
 	// Prepare output file for JSONL writes
 	jsonlFile, err := os.Create(jsonlPath)
-	if err != nil { panic(err) }
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create JSONL file: %v\n", err)
+		os.Exit(1)
+	}
 	defer jsonlFile.Close()
-	jsonlW := bufio.NewWriter(jsonlFile)
-	defer jsonlW.Flush()
+	jsonlWriter := bufio.NewWriter(jsonlFile)
+	defer jsonlWriter.Flush()
 
-	// channel to serialize JSONL writes and de-dup by event id
-	writeCh := make(chan evLine, 1024)
-	doneW := make(chan struct{})
-	seen := make(map[string]struct{})
-	var mu sync.Mutex
+	// Create batches and initialize progress tracking
+	batches := chunkAuthors(follows, *batchSize)
+	progress := &progressTracker{
+		batchesTotal: len(batches),
+		relaysTotal:  len(relays),
+	}
+	
+	fmt.Printf("    Querying %d relays with %d batches of ~%d authors each\n", 
+		len(relays), len(batches), *batchSize)
+	fmt.Printf("    Parallel workers: %d\n", *parallel)
+	fmt.Println()
+
+	// Channel to serialize JSONL writes and deduplicate by event ID
+	eventChan := make(chan eventLine, 1024)
+	writerDone := make(chan struct{})
+	seenEvents := make(map[string]struct{})
+	var seenMutex sync.Mutex
+	
+	// Start writer goroutine
 	go func() {
-		for rec := range writeCh {
-			mu.Lock()
-			if _, ok := seen[rec.id]; !ok {
-				seen[rec.id] = struct{}{}
-				fmt.Fprintln(jsonlW, rec.line)
+		for event := range eventChan {
+			progress.eventsReceived.Add(1)
+			seenMutex.Lock()
+			if _, exists := seenEvents[event.id]; !exists {
+				seenEvents[event.id] = struct{}{}
+				fmt.Fprintln(jsonlWriter, event.line)
+				progress.eventsWritten.Add(1)
 			}
-			mu.Unlock()
+			seenMutex.Unlock()
 		}
-		jsonlW.Flush()
-		close(doneW)
+		jsonlWriter.Flush()
+		close(writerDone)
 	}()
 
-	// batching authors
-	batches := chunk(follows, *batchSize)
-	sem := make(chan struct{}, *parallel)
-	var wg sync.WaitGroup
-	for _, rurl := range relays {
-		for _, authors := range batches {
-			sem <- struct{}{}
-			wg.Add(1)
-			go func(url string, auths []string) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				_ = fetch10002(ctx, url, auths, time.Duration(*timeoutSec)*time.Second, writeCh)
-			}(rurl, authors)
+	// Start progress reporter
+	progressDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressDone:
+				return
+			case <-ticker.C:
+				received := progress.eventsReceived.Load()
+				written := progress.eventsWritten.Load()
+				batchesDone := progress.batchesDone.Load()
+				totalBatches := int64(progress.batchesTotal * progress.relaysTotal)
+				pct := float64(batchesDone) / float64(totalBatches) * 100
+				fmt.Printf("    Progress: %d/%d batches (%.1f%%) | Events: %d received, %d unique\n",
+					batchesDone, totalBatches, pct, received, written)
+			}
 		}
-	}
-	wg.Wait()
-	close(writeCh)
-	<-doneW
+	}()
 
-	fmt.Println("Collection complete.")
-	fmt.Printf(" - JSONL written: %s\n", jsonlPath)
-	fmt.Printf(" - Follows written: %s\n", followsPath)
+	// Process relays with semaphore for parallelism control
+	// Each relay gets one connection that handles all batches
+	semaphore := make(chan struct{}, *parallel)
+	var wg sync.WaitGroup
+	
+	for _, relayURL := range relays {
+		semaphore <- struct{}{}
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			
+			if err := fetchAllBatches(ctx, url, batches, timeout, eventChan, progress); err != nil {
+				// Log errors but continue with other relays
+				fmt.Fprintf(os.Stderr, "    ⚠ Error from %s: %v\n", url, err)
+			}
+		}(relayURL)
+	}
+	
+	wg.Wait()
+	close(eventChan)
+	<-writerDone
+	close(progressDone)
+
+	// Final summary
+	fmt.Println()
+	fmt.Println("==> Collection complete")
+	fmt.Printf("    ✓ Total events received: %d\n", progress.eventsReceived.Load())
+	fmt.Printf("    ✓ Unique events written: %d\n", progress.eventsWritten.Load())
+	fmt.Printf("    ✓ JSONL file: %s\n", jsonlPath)
+	fmt.Printf("    ✓ Follows file: %s\n", followsPath)
+	fmt.Printf("    ✓ User relay list: %s\n", userRelayListPath)
+	fmt.Printf("    ✓ User pubkey: %s\n", userPubkeyPath)
 }
 
 func splitCSV(s string) []string {
@@ -125,104 +233,226 @@ func splitCSV(s string) []string {
 	return out
 }
 
-func isHex64(s string) bool {
-	if len(s) != 64 {
-		return false
+// fetchUserRelayList retrieves the user's own relay list (kind 10002) from a relay
+func fetchUserRelayList(ctx context.Context, relayURL, pubkey string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	
+	relay, err := nostr.RelayConnect(ctx, relayURL)
+	if err != nil {
+		return nil, fmt.Errorf("relay connect: %w", err)
 	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return false
+	defer relay.Close()
+
+	filters := nostr.Filters{
+		nostr.Filter{
+			Kinds:   []int{10002},
+			Authors: []string{strings.ToLower(pubkey)},
+			Limit:   1,
+		},
+	}
+	
+	subscription, err := relay.Subscribe(ctx, filters)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe: %w", err)
+	}
+	defer subscription.Unsub()
+
+	var relays []string
+	for {
+		select {
+		case <-ctx.Done():
+			return deduplicateAndSort(relays), nil
+		case <-subscription.EndOfStoredEvents:
+			// Relay finished sending stored events
+			return deduplicateAndSort(relays), nil
+		case event := <-subscription.Events:
+			if event == nil {
+				continue
+			}
+			if event.Kind != 10002 {
+				continue
+			}
+			// Extract relay URLs from r-tags
+			for _, tag := range event.Tags {
+				if len(tag) >= 2 && tag[0] == "r" {
+					relayURL := strings.TrimSpace(tag[1])
+					// Only include valid relay URLs (no query params, etc)
+					if isValidRelayURL(relayURL) {
+						relays = append(relays, relayURL)
+					}
+				}
+			}
 		}
 	}
-	return true
 }
 
-func fetchFollows(relayURL, pubkey string, timeout time.Duration) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// fetchFollows retrieves the follow list (kind 3) for a given pubkey from a relay
+func fetchFollows(ctx context.Context, relayURL, pubkey string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	r, err := nostr.RelayConnect(ctx, relayURL)
-	if err != nil { return nil, err }
-	defer r.Close()
+	
+	relay, err := nostr.RelayConnect(ctx, relayURL)
+	if err != nil {
+		return nil, fmt.Errorf("relay connect: %w", err)
+	}
+	defer relay.Close()
 
-	sub, err := r.Subscribe(ctx, nostr.Filters{
+	filters := nostr.Filters{
 		nostr.Filter{
 			Kinds:   []int{3},
 			Authors: []string{strings.ToLower(pubkey)},
 		},
-	})
-	if err != nil { return nil, err }
-	defer sub.Unsub()
+	}
+	
+	subscription, err := relay.Subscribe(ctx, filters)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe: %w", err)
+	}
+	defer subscription.Unsub()
 
 	var follows []string
-loop:
 	for {
 		select {
 		case <-ctx.Done():
-			break loop
-		case ev := <-sub.Events:
-			if ev == nil { continue }
-			if ev.Kind != 3 { continue }
-			// extract p-tags
-			for _, t := range ev.Tags {
-				if len(t) >= 2 && t[0] == "p" {
-					pk := strings.ToLower(t[1])
-					if isHex64(pk) {
-						follows = append(follows, pk)
+			return deduplicateAndSort(follows), nil
+		case <-subscription.EndOfStoredEvents:
+			// Relay finished sending stored events
+			return deduplicateAndSort(follows), nil
+		case event := <-subscription.Events:
+			if event == nil {
+				continue
+			}
+			if event.Kind != 3 {
+				continue
+			}
+			// Extract p-tags (pubkeys being followed)
+			for _, tag := range event.Tags {
+				if len(tag) >= 2 && tag[0] == "p" {
+					pubkeyHex := strings.ToLower(tag[1])
+					if isHex64(pubkeyHex) {
+						follows = append(follows, pubkeyHex)
 					}
 				}
 			}
-			break loop
 		}
 	}
-	// sort+unique
-	sort.Strings(follows)
-	uniq := make([]string, 0, len(follows))
-	var last string
-	for _, v := range follows {
-		if v != last { uniq = append(uniq, v); last = v }
-	}
-	return uniq, nil
 }
 
-func fetch10002(ctx context.Context, relayURL string, authors []string, timeout time.Duration, out chan<- evLine) error {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	r, err := nostr.RelayConnect(cctx, relayURL)
-	if err != nil { return err }
-	defer r.Close()
+// fetchAllBatches opens one connection to a relay and processes all batches sequentially
+func fetchAllBatches(ctx context.Context, relayURL string, batches [][]string, timeout time.Duration,
+	out chan<- eventLine, progress *progressTracker) error {
+	
+	// Connect once to the relay
+	connectCtx, connectCancel := context.WithTimeout(ctx, timeout)
+	defer connectCancel()
+	
+	relay, err := nostr.RelayConnect(connectCtx, relayURL)
+	if err != nil {
+		return fmt.Errorf("relay connect: %w", err)
+	}
+	defer relay.Close()
+	
+	// Process each batch with a new subscription on the same connection
+	for batchIdx, authors := range batches {
+		if err := fetchBatch(ctx, relay, relayURL, authors, batchIdx, timeout, out); err != nil {
+			// Log error but continue with next batch
+			fmt.Fprintf(os.Stderr, "    ⚠ Error from %s batch %d: %v\n", relayURL, batchIdx+1, err)
+		}
+		progress.batchesDone.Add(1)
+	}
+	
+	return nil
+}
 
-	// NIP-01 REQ with kinds 10002 and batched authors
-	// Validate and normalize authors to ensure all are 64-char hex.
+// fetchBatch retrieves kind 10002 events for a batch of authors using an existing relay connection
+func fetchBatch(ctx context.Context, relay *nostr.Relay, relayURL string, authors []string, batchIdx int,
+	timeout time.Duration, out chan<- eventLine) error {
+	
+	// Validate and normalize authors to ensure all are 64-char hex
 	validAuthors := make([]string, 0, len(authors))
-	for _, a := range authors {
-		a = strings.ToLower(strings.TrimSpace(a))
-		if isHex64(a) {
-			validAuthors = append(validAuthors, a)
+	for _, author := range authors {
+		author = strings.ToLower(strings.TrimSpace(author))
+		if isHex64(author) {
+			validAuthors = append(validAuthors, author)
 		}
 	}
+	
 	if len(validAuthors) == 0 {
 		return nil
 	}
-	f := nostr.Filters{
+	
+	// Create a timeout context for this batch
+	batchCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	
+	filters := nostr.Filters{
 		nostr.Filter{
 			Kinds:   []int{10002},
 			Authors: validAuthors,
 		},
 	}
-	sub, err := r.Subscribe(cctx, f)
-	if err != nil { return err }
-	defer sub.Unsub()
+	
+	subscription, err := relay.Subscribe(batchCtx, filters)
+	if err != nil {
+		return fmt.Errorf("subscribe: %w", err)
+	}
+	defer subscription.Unsub()
 
 	for {
 		select {
-		case <-cctx.Done():
+		case <-batchCtx.Done():
 			return nil
-		case ev := <-sub.Events:
-			if ev == nil { continue }
-			if ev.Kind != 10002 { continue }
-			line := ev.String()
-			out <- evLine{id: strings.ToLower(ev.ID), line: line}
+		case <-subscription.EndOfStoredEvents:
+			// Relay finished sending stored events, exit early
+			return nil
+		case event := <-subscription.Events:
+			if event == nil {
+				continue
+			}
+			if event.Kind != 10002 {
+				continue
+			}
+			line := event.String()
+			out <- eventLine{
+				id:   strings.ToLower(event.ID),
+				line: line,
+			}
 		}
 	}
+}
+
+// deduplicateAndSort removes duplicates and sorts a slice of strings
+func deduplicateAndSort(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	
+	sort.Strings(items)
+	unique := make([]string, 0, len(items))
+	last := ""
+	for _, item := range items {
+		if item != last {
+			unique = append(unique, item)
+			last = item
+		}
+	}
+	return unique
+}
+
+// chunkAuthors splits a slice of authors into batches of the specified size
+func chunkAuthors(authors []string, batchSize int) [][]string {
+	if batchSize <= 0 {
+		return [][]string{authors}
+	}
+	
+	var batches [][]string
+	for i := 0; i < len(authors); i += batchSize {
+		end := i + batchSize
+		if end > len(authors) {
+			end = len(authors)
+		}
+		batches = append(batches, authors[i:end])
+	}
+	return batches
 }
