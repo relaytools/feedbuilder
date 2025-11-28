@@ -105,7 +105,7 @@ Optional filters:
 
 Include notification streams in router config:
 ```
-./nostr-go-router gen-router \
+./feedbuilder gen-router \
   --data-dir ./relay_data \
   --output ./strfry-router.config \
   --include-notifs
