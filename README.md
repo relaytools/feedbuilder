@@ -121,6 +121,13 @@ This reads `user_pubkey.txt` and `user_relay_list.txt` (created by `collect` com
 
 Note: You must run `collect` with `--pubkey` first to populate these files.
 
+## Finished!
+The result of running the feedbuilder is a config file for strfry router.
+```
+strfry-router.config
+```
+For additional info on getting started with strfry see the [QUICKSTART](STRFRY_QUICKSTART.md)
+
 ## Features
 
 - **Intelligent relay selection**: Uses greedy set cover algorithm to minimize relay connections while maximizing author coverage
