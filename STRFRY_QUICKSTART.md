@@ -63,9 +63,15 @@ runs strfry in relay mode (listening and serving)
 CTRL-C to quit
 
 ## router
-runs the strfry router
+
+### feedbuilder
+This is where feedbuilder comes in. Follow the main [README](README.md). To install feedbuilder in your working directory and run it to generate your strfry-router.config
+
+then..
+
+run the router process
 ```
-./strfry router --config strfry-router.conf
+./strfry router --config strfry-router.config
 ```
 CTRL-C to quit
 
