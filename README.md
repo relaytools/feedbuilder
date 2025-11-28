@@ -39,6 +39,10 @@ cd feedbuilder
 go build
 ```
 
+- or -
+download a pre-built [binary from the releases page](https://github.com/relaytools/feedbuilder/releases)
+
+
 Collect your relay list, follows, and their relay lists:
 ```
 ./feedbuilder collect \
