@@ -98,6 +98,12 @@ func analyzeCmd(args []string) {
 		*followsFile = filepath.Join(dd, "follows_list.txt")
 	}
 	excludeFile := filepath.Join(dd, "outbox_exclude.txt")
+	followSetsDir := filepath.Join(dd, "follow_sets")
+
+	// Merge follow sets from individual files if they exist
+	if err := mergeFollowSets(followSetsDir, *followsFile); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to merge follow sets: %v\n", err)
+	}
 
 	// Load excludes -> hosts set
 	exHosts := set{}
@@ -277,24 +283,24 @@ type MonitorInfo struct {
 // fetchMonitorInfo queries for kind 10166 monitor announcements to get check frequencies
 func fetchMonitorInfo(monitorRelays []string, timeout time.Duration) map[string]*MonitorInfo {
 	monitors := make(map[string]*MonitorInfo)
-	
+
 	fmt.Println("    Fetching monitor announcements (kind 10166)...")
-	
+
 	for _, monitorRelay := range monitorRelays {
 		if monitorRelay == "" {
 			continue
 		}
-		
+
 		fmt.Printf("      Querying %s for monitor info...\n", monitorRelay)
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		
+
 		relay, err := nostr.RelayConnect(ctx, monitorRelay)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "      ⚠ Failed to connect: %v\n", err)
 			cancel()
 			continue
 		}
-		
+
 		// Query for kind 10166 monitor announcements
 		filters := nostr.Filters{
 			nostr.Filter{
@@ -302,7 +308,7 @@ func fetchMonitorInfo(monitorRelays []string, timeout time.Duration) map[string]
 				Limit: 100,
 			},
 		}
-		
+
 		sub, err := relay.Subscribe(ctx, filters)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "      ⚠ Failed to subscribe: %v\n", err)
@@ -310,7 +316,7 @@ func fetchMonitorInfo(monitorRelays []string, timeout time.Duration) map[string]
 			cancel()
 			continue
 		}
-		
+
 		eventsReceived := 0
 		// Collect monitor announcements
 		for {
@@ -330,7 +336,7 @@ func fetchMonitorInfo(monitorRelays []string, timeout time.Duration) map[string]
 					continue
 				}
 				eventsReceived++
-				
+
 				// Extract frequency from tags
 				var frequency int64 = 3600 // default 1 hour
 				for _, tag := range event.Tags {
@@ -341,7 +347,7 @@ func fetchMonitorInfo(monitorRelays []string, timeout time.Duration) map[string]
 						break
 					}
 				}
-				
+
 				monitors[event.PubKey] = &MonitorInfo{
 					Pubkey:    event.PubKey,
 					Frequency: frequency,
@@ -349,10 +355,10 @@ func fetchMonitorInfo(monitorRelays []string, timeout time.Duration) map[string]
 				fmt.Printf("      ✓ Monitor %s... (checks every %ds)\n", event.PubKey[:16], frequency)
 			}
 		}
-		nextRelay:
+	nextRelay:
 		fmt.Printf("      Received %d monitor announcements from %s\n", eventsReceived, monitorRelay)
 	}
-	
+
 	return monitors
 }
 
@@ -463,7 +469,7 @@ func fetchNIP66MonitorData(monitorRelays []string, targetRelays set, timeout tim
 // parseNIP66Event extracts monitoring data from a kind 30166 event
 func parseNIP66Event(event *nostr.Event, result map[string]*RelayMonitorInfo, monitors map[string]*MonitorInfo) {
 	var relayURL string
-	
+
 	// Extract d tag (relay URL)
 	// NIP-66 d-tags have trailing slashes, but our stored URLs don't
 	for _, tag := range event.Tags {
@@ -473,11 +479,11 @@ func parseNIP66Event(event *nostr.Event, result map[string]*RelayMonitorInfo, mo
 			break
 		}
 	}
-	
+
 	if relayURL == "" {
 		return
 	}
-	
+
 	info, exists := result[relayURL]
 	if !exists {
 		// This shouldn't happen since we initialized all target relays
@@ -490,7 +496,7 @@ func parseNIP66Event(event *nostr.Event, result map[string]*RelayMonitorInfo, mo
 	}
 
 	eventTime := event.CreatedAt.Time().Unix()
-	
+
 	// Update last checked time if this event is newer
 	if eventTime > info.LastChecked {
 		info.LastChecked = eventTime
@@ -506,13 +512,13 @@ func parseNIP66Event(event *nostr.Event, result map[string]*RelayMonitorInfo, mo
 		monitorFrequency = monitor.Frequency
 		monitorKnown = true
 	}
-	
+
 	// Check if this event is recent enough based on the monitor's frequency
 	// Allow 2x the frequency as a grace period (e.g., if monitor checks hourly, allow 2 hours)
 	freshnessWindow := monitorFrequency * 2
 	cutoff := time.Now().Unix() - freshnessWindow
 	isRecent := eventTime >= cutoff
-	
+
 	// Debug logging (only for first few relays to avoid spam)
 	if info.MonitorCount <= 2 {
 		age := time.Now().Unix() - eventTime
@@ -525,7 +531,7 @@ func parseNIP66Event(event *nostr.Event, result map[string]*RelayMonitorInfo, mo
 			isRecent,
 			monitorKnown)
 	}
-	
+
 	// Extract RTT values
 	hasRTT := false
 	for _, tag := range event.Tags {
@@ -650,4 +656,73 @@ func uniqueByHost(relayMap map[string]set) []string {
 		out = append(out, url)
 	}
 	return out
+}
+
+// mergeFollowSets reads individual follow set files and merges them with the main follows list
+func mergeFollowSets(followSetsDir, followsFile string) error {
+	// Check if follow_sets directory exists
+	if _, err := os.Stat(followSetsDir); os.IsNotExist(err) {
+		return nil
+	}
+
+	// Read existing follows from follows_list.txt
+	existingFollows := set{}
+	if lines, err := readLines(followsFile); err == nil {
+		for _, line := range lines {
+			line = strings.ToLower(strings.TrimSpace(line))
+			if line != "" && !strings.HasPrefix(line, "#") {
+				existingFollows.add(line)
+			}
+		}
+	}
+
+	// Read all follow set files
+	entries, err := os.ReadDir(followSetsDir)
+	if err != nil {
+		return fmt.Errorf("failed to read follow_sets directory: %w", err)
+	}
+
+	setsFound := 0
+	pubkeysAdded := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "follow_set_") || !strings.HasSuffix(entry.Name(), ".txt") {
+			continue
+		}
+
+		setPath := filepath.Join(followSetsDir, entry.Name())
+		lines, err := readLines(setPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to read %s: %v\n", entry.Name(), err)
+			continue
+		}
+
+		setsFound++
+		for _, line := range lines {
+			line = strings.ToLower(strings.TrimSpace(line))
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if !existingFollows.has(line) {
+				existingFollows.add(line)
+				pubkeysAdded++
+			}
+		}
+	}
+
+	if setsFound > 0 {
+		fmt.Printf("Merged %d follow sets (%d new pubkeys) into follows list\n", setsFound, pubkeysAdded)
+
+		// Write merged follows back to file
+		var allFollows []string
+		for pk := range existingFollows {
+			allFollows = append(allFollows, pk)
+		}
+		sort.Strings(allFollows)
+
+		if err := writeLines(followsFile, allFollows); err != nil {
+			return fmt.Errorf("failed to write merged follows: %w", err)
+		}
+	}
+
+	return nil
 }
