@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/relaytools/feedbuilder/internal/relayurl"
 )
 
 type Event struct {
@@ -143,12 +144,12 @@ func analyzeCmd(args []string) {
 		pk := strings.ToLower(ev.PubKey)
 		for _, tag := range ev.Tags {
 			if len(tag) >= 2 && tag[0] == "r" {
-				url := normalizeURL(tag[1])
-				if url == "" {
+				u, err := relayurl.New(tag[1])
+				if err != nil {
 					continue
 				}
-				host := urlToHost(url)
-				if exHosts.has(host) {
+				url := u.String()
+				if exHosts.has(u.Host()) {
 					continue
 				}
 				// If the URL points to an inbox endpoint, skip it and prefer a different URL for outbox
@@ -215,8 +216,12 @@ func analyzeCmd(args []string) {
 
 		// Collect all unique relay URLs we want to check
 		allRelays := set{}
-		for url := range writeMap {
-			allRelays.add(normalizeURL(url))
+		for rawURL := range writeMap {
+			u, err := relayurl.New(rawURL)
+			if err != nil {
+				continue
+			}
+			allRelays.add(u.String())
 		}
 
 		monitorData := fetchNIP66MonitorData(monitorRelayList, allRelays, time.Duration(*monitorTimeout)*time.Second)
@@ -236,16 +241,25 @@ func analyzeCmd(args []string) {
 		// Filter writePairs to only include online relays
 		var filteredPairs []string
 		onlineRelays := set{}
-		for url, info := range monitorData {
+		for rawURL, info := range monitorData {
 			if info.Status == "online" {
-				onlineRelays.add(normalizeURL(url))
+				u, err := relayurl.New(rawURL)
+				if err != nil {
+					continue
+				}
+				onlineRelays.add(u.String())
 			}
 		}
 
 		for _, pair := range writePairs {
 			fields := strings.Fields(pair)
 			if len(fields) >= 2 {
-				relayURL := normalizeURL(strings.Join(fields[1:], " "))
+				raw := strings.Join(fields[1:], " ")
+				u, err := relayurl.New(raw)
+				if err != nil {
+					continue
+				}
+				relayURL := u.String()
 				if onlineRelays.has(relayURL) {
 					filteredPairs = append(filteredPairs, pair)
 				}
@@ -367,9 +381,9 @@ func fetchNIP66MonitorData(monitorRelays []string, targetRelays set, timeout tim
 	result := make(map[string]*RelayMonitorInfo)
 
 	// Initialize all target relays as unknown
-	for url := range targetRelays {
-		result[url] = &RelayMonitorInfo{
-			URL:    url,
+	for relay := range targetRelays {
+		result[relay] = &RelayMonitorInfo{
+			URL:    relay,
 			Status: "unknown",
 		}
 	}
@@ -381,8 +395,8 @@ func fetchNIP66MonitorData(monitorRelays []string, targetRelays set, timeout tim
 	// Convert target relays to slice for filter
 	// NIP-66 requires normalized URLs with trailing slashes in d-tags
 	var dTags []string
-	for url := range targetRelays {
-		normalized := url
+	for relay := range targetRelays {
+		normalized := relay
 		if !strings.HasSuffix(normalized, "/") {
 			normalized += "/"
 		}
@@ -474,8 +488,11 @@ func parseNIP66Event(event *nostr.Event, result map[string]*RelayMonitorInfo, mo
 	// NIP-66 d-tags have trailing slashes, but our stored URLs don't
 	for _, tag := range event.Tags {
 		if len(tag) >= 2 && tag[0] == "d" {
-			// normalizeURL removes the trailing slash to match our stored URLs
-			relayURL = normalizeURL(tag[1])
+			u, err := relayurl.New(tag[1])
+			if err != nil {
+				continue
+			}
+			relayURL = u.String()
 			break
 		}
 	}
@@ -596,8 +613,8 @@ func writeMonitorReport(path string, data map[string]*RelayMonitorInfo) error {
 
 	// Sort by URL
 	var urls []string
-	for url := range data {
-		urls = append(urls, url)
+	for relayURL := range data {
+		urls = append(urls, relayURL)
 	}
 	sort.Strings(urls)
 
@@ -606,8 +623,8 @@ func writeMonitorReport(path string, data map[string]*RelayMonitorInfo) error {
 	fmt.Fprintln(w, "# Format: URL | Status | RTT-Open | RTT-Read | RTT-Write | Monitors | Last-Checked")
 	fmt.Fprintln(w, "")
 
-	for _, url := range urls {
-		info := data[url]
+	for _, relayURL := range urls {
+		info := data[relayURL]
 		lastChecked := "never"
 		if info.LastChecked > 0 {
 			lastChecked = time.Unix(info.LastChecked, 0).Format(time.RFC3339)
@@ -640,12 +657,12 @@ func uniqueByHost(relayMap map[string]set) []string {
 	have := set{}
 	var out []string
 	var urls []string
-	for url := range relayMap {
-		urls = append(urls, url)
+	for relay := range relayMap {
+		urls = append(urls, relay)
 	}
 	sort.Strings(urls)
-	for _, url := range urls {
-		h := urlToHost(url)
+	for _, relay := range urls {
+		h := urlToHost(relay)
 		if h == "" {
 			continue
 		}
@@ -653,7 +670,7 @@ func uniqueByHost(relayMap map[string]set) []string {
 			continue
 		}
 		have.add(h)
-		out = append(out, url)
+		out = append(out, relay)
 	}
 	return out
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	nostr "github.com/nbd-wtf/go-nostr"
+	"github.com/relaytools/feedbuilder/internal/relayurl"
 )
 
 // eventLine represents a relay list event for serialized JSONL writes
@@ -61,13 +62,33 @@ func collectCmd(args []string) {
 	userPubkeyPath := filepath.Join(dataDirectory, "user_pubkey.txt")
 	followSetsDir := filepath.Join(dataDirectory, "follow_sets")
 
-	relays := splitCSV(*relaysCSV)
-	if len(relays) == 0 {
+	relaysRaw := splitCSV(*relaysCSV)
+	if len(relaysRaw) == 0 {
 		fmt.Fprintln(os.Stderr, "no relays provided")
 		os.Exit(1)
 	}
-	followRelayURL := *followRelay
-	if followRelayURL == "" {
+	relays := make([]relayurl.RelayURL, 0, len(relaysRaw))
+	for _, raw := range relaysRaw {
+		r, err := relayurl.New(raw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping invalid relay URL %q: %v\n", raw, err)
+			continue
+		}
+		relays = append(relays, r)
+	}
+	if len(relays) == 0 {
+		fmt.Fprintln(os.Stderr, "no valid relays provided")
+		os.Exit(1)
+	}
+	var followRelayURL relayurl.RelayURL
+	if *followRelay != "" {
+		r, err := relayurl.New(*followRelay)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid follow-relay URL: %v\n", err)
+			os.Exit(1)
+		}
+		followRelayURL = r
+	} else {
 		followRelayURL = relays[0]
 	}
 
@@ -78,7 +99,7 @@ func collectCmd(args []string) {
 	fmt.Println("\n==> Step 1: Fetching your relay list (kind 10002)")
 	fmt.Printf("    Connecting to %s...\n", followRelayURL)
 
-	userRelays, err := fetchUserRelayList(ctx, followRelayURL, *pubkey, timeout)
+	userRelays, err := fetchUserRelayList(ctx, followRelayURL.String(), *pubkey, timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to get your relay list from %s: %v\n", followRelayURL, err)
 		// Continue anyway - not critical
@@ -96,7 +117,7 @@ func collectCmd(args []string) {
 	fmt.Println("\n==> Step 2: Fetching your follow list (kind 3)")
 	fmt.Printf("    Connecting to %s...\n", followRelayURL)
 
-	follows, err := fetchFollows(ctx, followRelayURL, *pubkey, timeout)
+	follows, err := fetchFollows(ctx, followRelayURL.String(), *pubkey, timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to get follows from %s: %v\n", followRelayURL, err)
 		os.Exit(1)
@@ -111,7 +132,7 @@ func collectCmd(args []string) {
 	if err := os.MkdirAll(followSetsDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to create follow_sets directory: %v\n", err)
 	} else {
-		followSets, err := fetchAndSaveFollowSets(ctx, followRelayURL, *pubkey, timeout, followSetsDir)
+		followSets, err := fetchAndSaveFollowSets(ctx, followRelayURL.String(), *pubkey, timeout, followSetsDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to get follow sets from %s: %v\n", followRelayURL, err)
 		} else {
@@ -216,18 +237,18 @@ func collectCmd(args []string) {
 	semaphore := make(chan struct{}, *parallel)
 	var wg sync.WaitGroup
 
-	for _, relayURL := range relays {
+	for _, relay := range relays {
 		semaphore <- struct{}{}
 		wg.Add(1)
-		go func(url string) {
+		go func(r relayurl.RelayURL) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
 
-			if err := fetchAllBatches(ctx, url, batches, timeout, eventChan, progress); err != nil {
+			if err := fetchAllBatches(ctx, r, batches, timeout, eventChan, progress); err != nil {
 				// Log errors but continue with other relays
-				fmt.Fprintf(os.Stderr, "    ⚠ Error from %s: %v\n", url, err)
+				fmt.Fprintf(os.Stderr, "    ⚠ Error from %s: %v\n", r, err)
 			}
-		}(relayURL)
+		}(relay)
 	}
 
 	wg.Wait()
@@ -301,11 +322,12 @@ func fetchUserRelayList(ctx context.Context, relayURL, pubkey string, timeout ti
 			// Extract relay URLs from r-tags
 			for _, tag := range event.Tags {
 				if len(tag) >= 2 && tag[0] == "r" {
-					relayURL := strings.TrimSpace(tag[1])
-					// Only include valid relay URLs (no query params, etc)
-					if isValidRelayURL(relayURL) {
-						relays = append(relays, relayURL)
+					raw := strings.TrimSpace(tag[1])
+					u, err := relayurl.New(raw)
+					if err != nil {
+						continue
 					}
+					relays = append(relays, u.String())
 				}
 			}
 		}
@@ -587,24 +609,24 @@ func sanitizeFilename(s string) string {
 }
 
 // fetchAllBatches opens one connection to a relay and processes all batches sequentially
-func fetchAllBatches(ctx context.Context, relayURL string, batches [][]string, timeout time.Duration,
+func fetchAllBatches(ctx context.Context, relay relayurl.RelayURL, batches [][]string, timeout time.Duration,
 	out chan<- eventLine, progress *progressTracker) error {
 
 	// Connect once to the relay
 	connectCtx, connectCancel := context.WithTimeout(ctx, timeout)
 	defer connectCancel()
 
-	relay, err := nostr.RelayConnect(connectCtx, relayURL)
+	relayConn, err := nostr.RelayConnect(connectCtx, relay.String())
 	if err != nil {
 		return fmt.Errorf("relay connect: %w", err)
 	}
-	defer relay.Close()
+	defer relayConn.Close()
 
 	// Process each batch with a new subscription on the same connection
 	for batchIdx, authors := range batches {
-		if err := fetchBatch(ctx, relay, relayURL, authors, batchIdx, timeout, out); err != nil {
+		if err := fetchBatch(ctx, relayConn, relay.String(), authors, batchIdx, timeout, out); err != nil {
 			// Log error but continue with next batch
-			fmt.Fprintf(os.Stderr, "    ⚠ Error from %s batch %d: %v\n", relayURL, batchIdx+1, err)
+			fmt.Fprintf(os.Stderr, "    ⚠ Error from %s batch %d: %v\n", relay, batchIdx+1, err)
 		}
 		progress.batchesDone.Add(1)
 	}
