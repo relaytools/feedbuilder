@@ -392,7 +392,8 @@ func fetchNIP66MonitorData(monitorRelays []string, targetRelays set, timeout tim
 	fmt.Printf("    Querying %d monitor relays for %d target relays...\n", len(monitorRelays), len(dTags))
 
 	// Batch size for d-tags to avoid "filter too large" errors
-	const batchSize = 10
+	// Note: relay URLs can be long, so we use a small batch size
+	const batchSize = 2
 
 	for _, monitorRelay := range monitorRelays {
 		if monitorRelay == "" {
@@ -432,9 +433,14 @@ func fetchNIP66MonitorData(monitorRelays []string, targetRelays set, timeout tim
 				},
 			}
 
+			// Debug: log filter details
+			filterJSON, _ := json.Marshal(filters)
+			fmt.Printf("    [DEBUG] Subscribing batch %d-%d, filter size: %d bytes\n", i, end, len(filterJSON))
+
 			sub, err := relay.Subscribe(ctx, filters)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "    ⚠ Failed to subscribe to %s (batch %d-%d): %v\n", monitorRelay, i, end, err)
+				fmt.Fprintf(os.Stderr, "    [DEBUG] Filter was: %s\n", string(filterJSON))
 				continue
 			}
 
