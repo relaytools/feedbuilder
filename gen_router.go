@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/relaytools/feedbuilder/internal/relayurl"
 )
 
 type streamConfig struct {
@@ -106,7 +108,9 @@ func greedySelectAndAssignN(relayAuthors map[string][]string, replicas int) ([]s
 		assigned[r] = uniqueSorted(assigned[r])
 	}
 	for i := range selected {
-		selected[i] = normalizeURL(selected[i])
+		if u, err := relayurl.New(selected[i]); err == nil {
+			selected[i] = u.String()
+		}
 	}
 	return selected, assigned
 }
@@ -152,12 +156,13 @@ func genRouterCmd(args []string) {
 				continue
 			}
 			pk := strings.ToLower(fields[0])
-			rurl := normalizeURL(strings.Join(fields[1:], " "))
-			if _, ok := followsSet[pk]; !ok {
+			rurlRaw := strings.Join(fields[1:], " ")
+			u, err := relayurl.New(rurlRaw)
+			if err != nil {
 				continue
 			}
-			// Skip invalid relay URLs
-			if !isValidRelayURL(rurl) {
+			rurl := u.String()
+			if _, ok := followsSet[pk]; !ok {
 				continue
 			}
 			relayAuthors[rurl] = append(relayAuthors[rurl], pk)
@@ -177,7 +182,9 @@ func genRouterCmd(args []string) {
 	var streams []streamConfig
 	// Create per-relay down streams for selected relays with their assigned authors
 	for _, relay := range selected {
-		relay = normalizeURL(relay)
+		if u, err := relayurl.New(relay); err == nil {
+			relay = u.String()
+		}
 		auths := assigned[relay]
 		if len(auths) == 0 {
 			continue
@@ -257,11 +264,13 @@ func genRouterCmd(args []string) {
 
 		// Load user's relay list from file and filter out invalid URLs
 		userRelaysRaw := readLinesIfExists(userRelayListFile)
-		var userRelays []string
-		for _, relay := range userRelaysRaw {
-			if isValidRelayURL(relay) {
-				userRelays = append(userRelays, relay)
+		userRelays := make([]string, 0, len(userRelaysRaw))
+		for _, relayLine := range userRelaysRaw {
+			u, err := relayurl.New(relayLine)
+			if err != nil {
+				continue
 			}
+			userRelays = append(userRelays, u.String())
 		}
 		if len(userRelays) == 0 {
 			fmt.Fprintf(os.Stderr, "warning: no user relay list found at %s, skipping notification streams\n", userRelayListFile)
@@ -271,7 +280,6 @@ func genRouterCmd(args []string) {
 
 			// Add stream for notifications mentioning user (inbox)
 			for _, relay := range userRelays {
-				relay = normalizeURL(relay)
 				name := fmt.Sprintf("notifs_inbox_%s", safeName(relay))
 				streams = append(streams, streamConfig{
 					Name:    name,
@@ -300,7 +308,9 @@ func readLinesMust(path string) []string {
 		os.Exit(1)
 	}
 	for i := range lines {
-		lines[i] = normalizeURL(lines[i])
+		if u, err := relayurl.New(lines[i]); err == nil {
+			lines[i] = u.String()
+		}
 	}
 	return lines
 }
@@ -311,7 +321,9 @@ func readLinesIfExists(path string) []string {
 		return nil
 	}
 	for i := range lines {
-		lines[i] = normalizeURL(lines[i])
+		if u, err := relayurl.New(lines[i]); err == nil {
+			lines[i] = u.String()
+		}
 	}
 	return lines
 }
