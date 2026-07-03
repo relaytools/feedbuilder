@@ -1,6 +1,9 @@
 package main
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // normalizeURL normalizes a relay URL by trimming whitespace, converting to lowercase, and removing trailing slashes
 func normalizeURL(s string) string {
@@ -21,6 +24,15 @@ func isValidRelayURL(s string) bool {
 	}
 	// Cannot contain query parameters or fragments
 	if strings.Contains(s, "?") || strings.Contains(s, "#") {
+		return false
+	}
+	// No userinfo (wss://@host or wss://user@host): not a real relay URL, and
+	// "@" breaks the taocpp key syntax in generated router configs
+	if strings.Contains(s, "@") {
+		return false
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Hostname() == "" {
 		return false
 	}
 	return true

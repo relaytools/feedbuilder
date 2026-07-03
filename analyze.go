@@ -105,15 +105,34 @@ func analyzeCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "warning: failed to merge follow sets: %v\n", err)
 	}
 
-	// Load excludes -> hosts set
+	// Load excludes -> hosts set; lines like "*.example.com" match any
+	// subdomain (used to keep our own hosted relays out of the outbox maps)
 	exHosts := set{}
+	exSuffixes := []string{}
 	if lines, err := readLines(excludeFile); err == nil {
 		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			if strings.HasPrefix(l, "*.") {
+				exSuffixes = append(exSuffixes, strings.ToLower(l[1:])) // ".example.com"
+				continue
+			}
 			h := urlToHost(l)
 			if h != "" {
 				exHosts.add(h)
 			}
 		}
+	}
+	hostExcluded := func(host string) bool {
+		if exHosts.has(host) {
+			return true
+		}
+		lh := strings.ToLower(host)
+		for _, suf := range exSuffixes {
+			if strings.HasSuffix(lh, suf) {
+				return true
+			}
+		}
+		return false
 	}
 
 	// Parse JSONL 10002 events
@@ -147,8 +166,13 @@ func analyzeCmd(args []string) {
 				if url == "" {
 					continue
 				}
+				// malformed relay URLs (userinfo, no host, ...) must never
+				// enter the write map or they'd poison the set cover
+				if !isValidRelayURL(url) {
+					continue
+				}
 				host := urlToHost(url)
-				if exHosts.has(host) {
+				if hostExcluded(host) {
 					continue
 				}
 				// If the URL points to an inbox endpoint, skip it and prefer a different URL for outbox

@@ -19,6 +19,8 @@ func main() {
 		genRouterCmd(os.Args[2:])
 	case "collect":
 		collectCmd(os.Args[2:])
+	case "backup":
+		backupCmd(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -34,6 +36,7 @@ func usage() {
 	fmt.Println("  collect     Fetch follows (kind 3) and relay lists (kind 10002) into data dir")
 	fmt.Println("  analyze     Parse 10002 JSONL, build maps, apply excludes, compute optimal and outbox sets")
 	fmt.Println("  gen-router  Generate strfry router config from analysis outputs")
+	fmt.Println("  backup      Sync the user's own notes from their relay list into a target relay (negentropy, REQ-scrape fallback)")
 	fmt.Println("\nUse '<subcommand> -h' for flags.")
 }
 

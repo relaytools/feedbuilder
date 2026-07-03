@@ -125,6 +125,8 @@ func genRouterCmd(args []string) {
 	// Notification sync options
 	includeNotifs := fs.Bool("include-notifs", false, "add streams for user notifications (your posts and mentions)")
 
+	pushURL := fs.String("push-url", "", "add an up stream pushing local events to this relay URL (kind-filtered by --kinds-json)")
+
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to parse flags: %v\n", err)
 		os.Exit(1)
@@ -278,11 +280,26 @@ func genRouterCmd(args []string) {
 					Dir:     "down",
 					Authors: nil, // No authors filter for inbox
 					URLs:    []string{relay},
-					Kinds:   *kindsJSON,
-					PTag:    pubkey, // Special field for #p filter
+					// Never kind-filter notifications: zap receipts (9735) and
+					// DM gift wraps (1059) are signed by keys outside the
+					// follow set and must not be dropped.
+					Kinds: "",
+					PTag:  pubkey, // Special field for #p filter
 				})
 			}
 		}
+	}
+
+	// Push everything spidered into a co-located relay (e.g. pyramid).
+	// The kinds filter keeps events the target would reject (1059, 9735 from
+	// non-members) from bouncing off it forever.
+	if *pushURL != "" {
+		streams = append(streams, streamConfig{
+			Name:  "push_up",
+			Dir:   "up",
+			URLs:  []string{*pushURL},
+			Kinds: *kindsJSON,
+		})
 	}
 
 	// Write taocpp::config
@@ -363,9 +380,19 @@ func chunk[T any](in []T, n int) [][]T {
 func safeName(relay string) string {
 	name := strings.TrimPrefix(relay, "wss://")
 	name = strings.TrimPrefix(name, "ws://")
-	name = strings.ReplaceAll(name, ":", "_")
-	name = strings.ReplaceAll(name, "/", "_")
-	name = strings.ReplaceAll(name, ".", "_")
+	// taocpp config keys: keep strictly [a-zA-Z0-9_], replace everything else
+	var b strings.Builder
+	for _, c := range name {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	name = b.String()
+	if name == "" || (name[0] >= '0' && name[0] <= '9') {
+		name = "r_" + name
+	}
 	return name
 }
 
