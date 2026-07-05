@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 type streamConfig struct {
@@ -127,6 +129,8 @@ func genRouterCmd(args []string) {
 
 	pushURL := fs.String("push-url", "", "add an up stream pushing local events to this relay URL (kind-filtered by --kinds-json)")
 
+	moderationURL := fs.String("moderation-url", "", "fetch {allow,block} pubkey lists from this URL and exclude blocked authors from all streams")
+
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to parse flags: %v\n", err)
 		os.Exit(1)
@@ -144,6 +148,23 @@ func genRouterCmd(args []string) {
 	userPubkeyFile := filepath.Join(dd, "user_pubkey.txt")
 
 	followsSet := loadSetMust(followsFile)
+
+	// Banned authors must not be spidered even when followed: the router
+	// writes straight to the DB, so exclusion here is the only enforcement
+	// point on this path. Fail open — a moderation outage must not stop the
+	// pipeline.
+	if *moderationURL != "" {
+		if blocked, err := fetchBlockedPubkeys(*moderationURL); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: moderation fetch failed (%v); not excluding anyone\n", err)
+		} else {
+			for pk := range blocked {
+				delete(followsSet, pk)
+			}
+			if len(blocked) > 0 {
+				fmt.Printf("Excluding %d banned author(s) from streams\n", len(blocked))
+			}
+		}
+	}
 	// Build relay->authors from pubkey_relays_map
 	relayAuthors := make(map[string][]string)
 	{
@@ -308,6 +329,29 @@ func genRouterCmd(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Wrote %s (%d streams)\n", *output, len(streams))
+}
+
+func fetchBlockedPubkeys(url string) (map[string]struct{}, error) {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var mr struct {
+		Block []string `json:"block"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&mr); err != nil {
+		return nil, err
+	}
+	blocked := make(map[string]struct{}, len(mr.Block))
+	for _, pk := range mr.Block {
+		blocked[strings.ToLower(pk)] = struct{}{}
+	}
+	return blocked, nil
 }
 
 func readLinesMust(path string) []string {
