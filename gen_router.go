@@ -14,12 +14,13 @@ import (
 )
 
 type streamConfig struct {
-	Name    string
-	Dir     string // "down" or "up"
-	Authors []string
-	URLs    []string
-	Kinds   string // raw JSON array or empty
-	PTag    string // for #p filter (notifications)
+	Name       string
+	Dir        string // "down" or "up"
+	Authors    []string
+	URLs       []string
+	Kinds      string // raw JSON array or empty
+	PTag       string // for #p filter (notifications)
+	PluginDown string // command to vet received events before storage
 }
 
 // greedySelectAndAssignN selects relays greedily so that each author is assigned
@@ -130,6 +131,11 @@ func genRouterCmd(args []string) {
 	pushURL := fs.String("push-url", "", "add an up stream pushing local events to this relay URL (kind-filtered by --kinds-json)")
 
 	moderationURL := fs.String("moderation-url", "", "fetch {allow,block} pubkey lists from this URL and exclude blocked authors from all streams")
+
+	// Remote relays are trusted to apply our filters but some return events we
+	// never asked for; a pluginDown command lets strfry vet each received
+	// event before storing it (see wot-plugin's router-filter daemon mode).
+	pluginDown := fs.String("plugin-down", "", "pluginDown command added to every down stream")
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to parse flags: %v\n", err)
@@ -323,6 +329,14 @@ func genRouterCmd(args []string) {
 		})
 	}
 
+	if *pluginDown != "" {
+		for i := range streams {
+			if streams[i].Dir == "down" {
+				streams[i].PluginDown = *pluginDown
+			}
+		}
+	}
+
 	// Write taocpp::config
 	if err := writeRouterConfig(*output, streams); err != nil {
 		fmt.Fprintf(os.Stderr, "error writing router config: %v\n", err)
@@ -482,6 +496,9 @@ func writeRouterConfig(path string, streams []streamConfig) error {
 		} else if s.Dir == "up" && s.Kinds != "" {
 			// Optional kinds filter for uploads
 			fmt.Fprintf(w, "    filter = { \"kinds\": %s }\n", s.Kinds)
+		}
+		if s.PluginDown != "" {
+			fmt.Fprintf(w, "    pluginDown = \"%s\"\n", s.PluginDown)
 		}
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "    urls = [")
